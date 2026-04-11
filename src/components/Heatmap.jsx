@@ -41,8 +41,18 @@ export default function Heatmap() {
   const scrollTo = (ref) => ref.current?.scrollIntoView({ behavior: 'smooth' });
 
   // --- ROUTING ---
+  // --- ROUTING ---
   useEffect(() => {
-    const handleHash = () => setGroupId(window.location.hash.replace('#/', ''));
+    const handleHash = () => {
+      const currentHash = window.location.hash;
+      setGroupId(currentHash.replace('#/', ''));
+      
+      // NEW: Tell the parent window (if it exists) to update its URL
+      if (window.parent !== window) {
+        window.parent.postMessage({ type: 'HASH_UPDATE', hash: currentHash }, '*');
+      }
+    };
+    
     window.addEventListener('hashchange', handleHash);
     if (groupId) fetchGroupInfo();
     return () => window.removeEventListener('hashchange', handleHash);
@@ -344,9 +354,15 @@ export default function Heatmap() {
         <header className="bg-white p-8 rounded-[3.5rem] shadow-xl border flex flex-col xl:flex-row justify-between items-center gap-8">
            <div className="text-center xl:text-left">
               <h1 className="text-5xl font-black tracking-tighter italic text-slate-800 uppercase leading-none">{groupInfo?.title || 'Loading...'}</h1>
-              <button onClick={() => {navigator.clipboard.writeText(window.location.href); alert("Link copied!")}} className="mt-6 flex items-center gap-2 bg-emerald-500 text-white px-6 py-3 rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg hover:bg-emerald-600 transition-colors">
-                 <Share2 size={14}/> Invite Friends
-              </button>
+              <button onClick={() => {
+      // NEW: Hardcode your custom domain for the share link
+      const customLink = `https://life.minescout.net/projects/booking/index.html${window.location.hash}`;
+      navigator.clipboard.writeText(customLink); 
+      alert("Link copied!");
+    }} 
+    className="mt-6 flex items-center gap-2 bg-emerald-500 text-white px-6 py-3 rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg hover:bg-emerald-600 transition-colors">
+     <Share2 size={14}/> Invite Friends
+  </button>
            </div>
            
            <div className="flex flex-wrap justify-center gap-4 bg-slate-50 p-5 rounded-[3rem] border border-slate-100 relative shadow-inner">
