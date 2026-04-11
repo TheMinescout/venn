@@ -12,7 +12,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "homepage": "https://theminescout.github.io/venn/",
+    "homepage": "https://TheMinescout.github.io/venn/",
     "@supabase/supabase-js": "^2.103.0",
     "ical.js": "^2.2.1",
     "lucide-react": "^1.8.0",
