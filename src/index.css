@@ -1,5 +1,61 @@
 @import "tailwindcss";
 
+@theme {
+  --font-sans: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Bricolage Grotesque", "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+  --color-paper: #fafaf8;
+  --color-ink: #16261f;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
 body {
-  background-color: #f8fafc;
+  background-color: var(--color-paper);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+:focus-visible {
+  outline: 2px solid #059669;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Entrances — one orchestrated moment on the hero, quiet everywhere else */
+@keyframes venn-slide-left {
+  from { opacity: 0; transform: translateX(-56px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes venn-slide-right {
+  from { opacity: 0; transform: translateX(56px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes venn-rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes venn-pop {
+  from { opacity: 0; transform: scale(0.96) translateY(4px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.anim-slide-left  { animation: venn-slide-left 0.8s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+.anim-slide-right { animation: venn-slide-right 0.8s cubic-bezier(0.2, 0.7, 0.2, 1) 0.12s both; }
+.anim-rise        { animation: venn-rise 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+.anim-pop         { animation: venn-pop 0.18s ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .anim-slide-left,
+  .anim-slide-right,
+  .anim-rise,
+  .anim-pop {
+    animation: none;
+  }
+  .transition-all, .transition-colors, .transition-transform {
+    transition: none !important;
+  }
 }
