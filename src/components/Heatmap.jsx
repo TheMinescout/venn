@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { supabase } from '../supabase';
 import ICAL from 'ical.js';
 import {
@@ -11,11 +11,29 @@ const AVATAR_COLORS = ['#0d9488', '#0891b2', '#7c3aed', '#db2777', '#ea580c', '#
 const avatarColor = (name) =>
   AVATAR_COLORS[[...(name || 'x')].reduce((a, c) => a + c.charCodeAt(0), 0) % AVATAR_COLORS.length];
 
+// --- helpers ---
+// Date-only strings ("2026-03-05") parse as UTC midnight, which renders one day
+// early for anyone west of UTC. Always parse them as local midnight for display.
+const asDate = (iso) => new Date(iso + 'T00:00:00');
+const localISO = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+const sha256 = async (text) => {
+  if (!crypto?.subtle) return null; // insecure context — callers fall back to plaintext compare
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+};
+
+const makeGroupId = () =>
+  (crypto.randomUUID?.() || `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`)
+    .replace(/-/g, '').slice(0, 12);
+
 export default function Heatmap() {
   const [groupId, setGroupId] = useState(window.location.hash.replace('#/', ''));
   const [groupInfo, setGroupInfo] = useState(null);
+  const [notFound, setNotFound] = useState(false);
   const [newTitle, setNewTitle] = useState("");
-  const [startDate, setStartDate] = useState(new Date().toISOString().split('T')[0]);
+  const [startDate, setStartDate] = useState(localISO(new Date()));
   const [endDate, setEndDate] = useState("");
   const [granularity, setGranularity] = useState(60);
   const [weekOffset, setWeekOffset] = useState(0);
@@ -38,6 +56,20 @@ export default function Heatmap() {
   const [ignoreAllDay, setIgnoreAllDay] = useState(true);
   const [showSecurityMenu, setShowSecurityMenu] = useState(false);
 
+  // --- TOASTS ---
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+  const showToast = useCallback((message, kind = 'ok') => {
+    setToast({ message, kind });
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2800);
+  }, []);
+  const toastEl = toast && (
+    <div className={`anim-pop fixed bottom-6 left-1/2 z-[100] -translate-x-1/2 rounded-xl px-5 py-3 text-sm font-semibold text-white shadow-2xl ${toast.kind === 'err' ? 'bg-rose-600' : 'bg-ink'}`}>
+      {toast.message}
+    </div>
+  );
+
   // --- REFS FOR LANDING PAGE ---
   const createRef = useRef(null);
   const featuresRef = useRef(null);
@@ -56,75 +88,95 @@ export default function Heatmap() {
     };
 
     window.addEventListener('hashchange', handleHash);
-    if (groupId) fetchGroupInfo();
     return () => window.removeEventListener('hashchange', handleHash);
+  }, []);
+
+  // Load (or reset) group state whenever the group in the URL changes
+  useEffect(() => {
+    setWeekOffset(0);
+    setHoveredBlock(null);
+    if (!groupId) {
+      setGroupInfo(null);
+      setAllData([]);
+      setNotFound(false);
+      return;
+    }
+    setNotFound(false);
+    (async () => {
+      const { data, error } = await supabase.from('groups').select('*').eq('id', groupId).single();
+      if (error || !data) setNotFound(true);
+      else setGroupInfo(data);
+    })();
   }, [groupId]);
 
-  const fetchGroupInfo = async () => {
+  const fetchData = useCallback(async () => {
     if (!groupId) return;
-    const { data } = await supabase.from('groups').select('*').eq('id', groupId).single();
-    if (data) setGroupInfo(data);
-  };
-
-  const createGroup = async () => {
-    if (!newTitle || !startDate || !endDate) return alert("Fill in all fields!");
-    const id = Math.random().toString(36).substring(2, 9);
-    const { error } = await supabase.from('groups').insert({ id, title: newTitle, start_date: startDate, end_date: endDate, granularity });
-    if (!error) {
-      window.location.hash = `/${id}`;
-    } else alert(error.message);
-  };
+    const { data, error } = await supabase.from('squad_blocks').select('*').eq('group_id', groupId);
+    if (error) { showToast("Couldn't load availability.", 'err'); return; }
+    setAllData(data || []);
+  }, [groupId, showToast]);
 
   // --- DATA SYNC ---
-  const fetchData = async () => {
-    if (!groupId) return;
-    const { data } = await supabase.from('squad_blocks').select('*').eq('group_id', groupId);
-    setAllData(data || []);
-  };
-
   useEffect(() => {
     if (!groupId) return;
     fetchData();
     const sub = supabase.channel(`g-${groupId}`).on('postgres_changes', { event: '*', schema: 'public', table: 'squad_blocks', filter: `group_id=eq.${groupId}` }, fetchData).subscribe();
     return () => supabase.removeChannel(sub);
-  }, [groupId]);
+  }, [groupId, fetchData]);
 
+  // --- NAME LOCK CHECK (debounced so typing doesn't hammer the database) ---
   useEffect(() => {
     if (!userName) return;
-    const check = async () => {
+    const t = setTimeout(async () => {
       const { data } = await supabase.from('user_settings').select('password, ignore_all_day').eq('user_name', userName).single();
-      if (data && data.password && data.password.trim() !== "") {
+      if (!data) return;
+      if (data.password && data.password.trim() !== "") {
         setIsLockedBySomeone(true);
-        setIsAuthorized(data.password === password);
+        const hashed = await sha256(password);
+        if (hashed && data.password === hashed) {
+          setIsAuthorized(true);
+          localStorage.setItem('venn_pw', password); // persist only once it actually works
+        } else if (data.password === password) {
+          // Legacy plaintext row: authorize and transparently upgrade it to a hash
+          setIsAuthorized(true);
+          localStorage.setItem('venn_pw', password);
+          if (hashed) supabase.from('user_settings').update({ password: hashed }).eq('user_name', userName);
+        } else {
+          setIsAuthorized(false);
+        }
         setIgnoreAllDay(data.ignore_all_day);
       } else {
         setIsLockedBySomeone(false);
         setIsAuthorized(true);
         if (data) setIgnoreAllDay(data.ignore_all_day);
       }
-    };
-    check();
+    }, 300);
+    return () => clearTimeout(t);
   }, [userName, password]);
 
   // --- PASSWORD MANAGEMENT ---
   const handleSetPassword = async () => {
-    if (!password) return alert("Please enter a password in the top bar first.");
-    const { error } = await supabase.from('user_settings').upsert({ user_name: userName, password: password, ignore_all_day: ignoreAllDay });
+    if (!password) return showToast('Type a password in the bar above first.', 'err');
+    const hashed = await sha256(password);
+    if (!hashed) return showToast("This browser can't hash passwords — the page must be served over HTTPS.", 'err');
+    const { error } = await supabase.from('user_settings').upsert({ user_name: userName, password: hashed, ignore_all_day: ignoreAllDay });
     if (!error) {
-        setIsLockedBySomeone(true);
-        alert("Password protection enabled!");
-    } else alert(error.message);
+      setIsLockedBySomeone(true);
+      setIsAuthorized(true);
+      showToast('Your name is now password-protected.');
+    } else showToast(error.message, 'err');
   };
 
   const handleRemovePassword = async () => {
-    if (window.confirm("Are you sure you want to remove password protection for this name?")) {
-        const { error } = await supabase.from('user_settings').update({ password: "" }).eq('user_name', userName);
-        if (!error) {
-            setIsLockedBySomeone(false);
-            setPassword('');
-            localStorage.removeItem('venn_pw');
-            alert("Password removed!");
-        } else alert(error.message);
+    if (window.confirm("Remove password protection for this name?")) {
+      const { error } = await supabase.from('user_settings').update({ password: "" }).eq('user_name', userName);
+      if (!error) {
+        setIsLockedBySomeone(false);
+        setIsAuthorized(true);
+        setPassword('');
+        localStorage.removeItem('venn_pw');
+        showToast('Password removed.');
+      } else showToast(error.message, 'err');
     }
   };
 
@@ -151,6 +203,11 @@ export default function Heatmap() {
     return DATES.slice(weekOffset * 7, (weekOffset * 7) + 7);
   }, [DATES, weekOffset]);
 
+  // Keep the week cursor inside the event's date range
+  useEffect(() => {
+    if (DATES.length && weekOffset * 7 >= DATES.length) setWeekOffset(0);
+  }, [DATES, weekOffset]);
+
   // O(1) lookup for your personal blocks
   const myBlocksSet = useMemo(() => {
     return new Set((allData || []).filter(d => d.user_name === userName).map(d => d.block_id));
@@ -168,76 +225,116 @@ export default function Heatmap() {
   }, [allData]);
 
   // --- VISUAL HELPERS (presentation only) ---
-  const todayISO = new Date().toISOString().split('T')[0];
+  const todayISO = useMemo(() => localISO(new Date()), []);
   const weekLabel = useMemo(() => {
     if (!currentWeekDates.length) return '';
-    const first = new Date(currentWeekDates[0]).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-    const last = new Date(currentWeekDates[currentWeekDates.length - 1]).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    const first = asDate(currentWeekDates[0]).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    const last = asDate(currentWeekDates[currentWeekDates.length - 1]).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     return `${first} – ${last}`;
   }, [currentWeekDates]);
 
-  // --- TOOLS ---
-  const handleSelectAll = async () => {
-    if (!userName) return alert("Enter name!");
-    const inserts = [];
-    DATES.forEach(d => SLOTS.forEach(s => inserts.push({ group_id: groupId, block_id: `${d}-${s}`, user_name: userName })));
-    await supabase.from('squad_blocks').upsert(inserts);
-    fetchData();
+  // --- CHUNKED WRITES (keeps big selections under URL/payload limits) ---
+  const upsertInChunks = async (rows) => {
+    for (let i = 0; i < rows.length; i += 500) {
+      const { error } = await supabase.from('squad_blocks').upsert(rows.slice(i, i + 500));
+      if (error) throw new Error(error.message);
+    }
   };
-
-  const handleClearAll = async () => {
-    if (!userName) return alert("Enter name!");
-    if (window.confirm("Clear your schedule?")) {
-      await supabase.from('squad_blocks').delete().match({ group_id: groupId, user_name: userName });
-      fetchData();
+  const deleteInChunks = async (blockIds) => {
+    for (let i = 0; i < blockIds.length; i += 500) {
+      const { error } = await supabase.from('squad_blocks').delete().match({ group_id: groupId, user_name: userName }).in('block_id', blockIds.slice(i, i + 500));
+      if (error) throw new Error(error.message);
     }
   };
 
-  const handleInvert = async () => {
-    if (!userName) return;
-    const inverted = [];
+  // --- TOOLS ---
+  const handleSelectAll = async () => {
+    if (!userName) return showToast('Enter your name first.', 'err');
+    const inserts = [];
     DATES.forEach(d => SLOTS.forEach(s => {
-        const bid = `${d}-${s}`;
-        if (!myBlocksSet.has(bid)) inverted.push({ group_id: groupId, block_id: bid, user_name: userName });
+      const bid = `${d}-${s}`;
+      if (!myBlocksSet.has(bid)) inserts.push({ group_id: groupId, block_id: bid, user_name: userName });
     }));
-    await supabase.from('squad_blocks').delete().match({ group_id: groupId, user_name: userName });
-    await supabase.from('squad_blocks').upsert(inverted);
-    fetchData();
+    try {
+      await upsertInChunks(inserts);
+      fetchData();
+    } catch (e) { showToast("Couldn't save — " + e.message, 'err'); }
+  };
+
+  const handleClearAll = async () => {
+    if (!userName) return showToast('Enter your name first.', 'err');
+    if (window.confirm("Clear your schedule?")) {
+      const { error } = await supabase.from('squad_blocks').delete().match({ group_id: groupId, user_name: userName });
+      if (!error) { fetchData(); showToast('Schedule cleared.'); }
+      else showToast(error.message, 'err');
+    }
+  };
+
+  // Crash-safe invert: add the new blocks FIRST, then remove the old ones.
+  // If it fails partway, you end up with extra blocks (re-run to fix), never an empty schedule.
+  const handleInvert = async () => {
+    if (!userName) return showToast('Enter your name first.', 'err');
+    const toAdd = [];
+    DATES.forEach(d => SLOTS.forEach(s => {
+      const bid = `${d}-${s}`;
+      if (!myBlocksSet.has(bid)) toAdd.push({ group_id: groupId, block_id: bid, user_name: userName });
+    }));
+    const toRemove = [...myBlocksSet];
+    try {
+      await upsertInChunks(toAdd);
+      await deleteInChunks(toRemove);
+      fetchData();
+    } catch (e) { showToast("Couldn't invert — " + e.message, 'err'); }
   };
 
   const handleCalendarSync = async () => {
+    if (!userName) return showToast('Enter your name first.', 'err');
     setIsSyncing(true);
     try {
-      let calId = calUrl;
-      if (calUrl.includes("cid=")) calId = atob(calUrl.split('cid=')[1].split('&')[0]);
-      else if (calUrl.includes("src=")) calId = decodeURIComponent(calUrl.split('src=')[1].split('&')[0]);
+      let calId = calUrl.trim();
+      if (!calId) throw new Error('paste a calendar link first');
+      if (calId.includes("cid=")) calId = atob(calId.split('cid=')[1].split('&')[0]);
+      else if (calId.includes("src=")) calId = decodeURIComponent(calUrl.split('src=')[1].split('&')[0]);
       const scriptUrl = "https://script.google.com/macros/s/AKfycbyzwwbQhCzjXUO9Bo_TE3ekaFg7--Y61njos8QW2Kj9UsFFLd4LyoUTDWLMb2dwY94k/exec";
       const res = await fetch(`${scriptUrl}?calId=${encodeURIComponent(calId)}`);
+      if (!res.ok) throw new Error('the calendar service returned an error');
       const ics = await res.text();
       const jcal = ICAL.parse(ics);
       const events = new ICAL.Component(jcal).getAllSubcomponents('vevent');
-      const busy = [];
+      const busy = new Set(); // Set — overlapping events no longer produce duplicate block ids
       events.forEach(ev => {
         const item = new ICAL.Event(ev);
         const start = item.startDate.toJSDate();
         const end = item.endDate.toJSDate();
-        if ((item.startDate.isDate || (end-start)/3600000 >= 23) && ignoreAllDay) return;
+        if ((item.startDate.isDate || (end - start) / 3600000 >= 23) && ignoreAllDay) return;
         DATES.forEach(d => SLOTS.forEach(s => {
           const sT = new Date(d + 'T' + s + ':00');
           const eT = new Date(sT.getTime() + (groupInfo?.granularity || 60) * 60000);
-          if (start < eT && end > sT) busy.push(`${d}-${s}`);
+          if (start < eT && end > sT) busy.add(`${d}-${s}`);
         }));
       });
-      if (busy.length) await supabase.from('squad_blocks').delete().match({ group_id: groupId, user_name: userName }).in('block_id', busy);
+      // Replace semantics: your schedule becomes "every slot minus your busy hours".
+      // Add free time first, then remove busy — crash-safe in the recoverable direction.
+      const free = [];
+      DATES.forEach(d => SLOTS.forEach(s => {
+        const bid = `${d}-${s}`;
+        if (!busy.has(bid) && !myBlocksSet.has(bid)) free.push({ group_id: groupId, block_id: bid, user_name: userName });
+      }));
+      const busyMine = [...busy].filter(b => myBlocksSet.has(b));
+      await upsertInChunks(free);
+      await deleteInChunks(busyMine);
       fetchData();
-      alert("Sync Complete!");
-    } catch (e) { alert("Sync failed."); }
+      showToast('Calendar synced.');
+    } catch (e) {
+      showToast('Sync failed — ' + e.message, 'err');
+    }
     setIsSyncing(false);
   };
 
-  // --- INTERACTION ---
-  const handleMouseDown = (d, s) => {
+  // --- INTERACTION (pointer events: works with mouse, touch, and stylus) ---
+  const handleCellPointerDown = (e, d, s) => {
     if (!isAuthorized || !userName) return;
+    e.preventDefault();
     setIsDragging(true);
 
     // Determine if we are painting 'on' or 'off' based on the first cell
@@ -248,8 +345,13 @@ export default function Heatmap() {
     setDragEnd({ dateIdx: d, slotIdx: s });
   };
 
-  const handleMouseEnter = (d, s) => {
-    if (isDragging) setDragEnd({ dateIdx: d, slotIdx: s });
+  // While dragging, find the cell under the pointer. elementFromPoint is the only
+  // reliable way to do this for touch, because touch pointers never fire enter
+  // events on the elements they pass over.
+  const handleGridPointerMove = (e) => {
+    if (!isDragging) return;
+    const el = document.elementFromPoint(e.clientX, e.clientY)?.closest?.('[data-cell]');
+    if (el) setDragEnd({ dateIdx: +el.dataset.d, slotIdx: +el.dataset.s });
   };
 
   const commitDrag = async () => {
@@ -260,19 +362,23 @@ export default function Heatmap() {
 
     const blocksToProcess = [];
     for (let d = minD; d <= maxD; d++) {
-        for (let s = minS; s <= maxS; s++) {
-            blocksToProcess.push(`${currentWeekDates[d]}-${SLOTS[s]}`);
-        }
+      for (let s = minS; s <= maxS; s++) {
+        blocksToProcess.push(`${currentWeekDates[d]}-${SLOTS[s]}`);
+      }
     }
 
-    if (dragAction === 'remove') {
-      await supabase.from('squad_blocks').delete().match({ group_id: groupId, user_name: userName }).in('block_id', blocksToProcess);
-    } else {
-      // Only upsert blocks that aren't already there to save network request size
-      const newBlocks = blocksToProcess.filter(b => !myBlocksSet.has(b));
-      if (newBlocks.length > 0) {
-        await supabase.from('squad_blocks').upsert(newBlocks.map(bid => ({ group_id: groupId, block_id: bid, user_name: userName })));
+    try {
+      if (dragAction === 'remove') {
+        await deleteInChunks(blocksToProcess);
+      } else {
+        // Only upsert blocks that aren't already there to save network request size
+        const newBlocks = blocksToProcess.filter(b => !myBlocksSet.has(b));
+        if (newBlocks.length > 0) {
+          await upsertInChunks(newBlocks.map(bid => ({ group_id: groupId, block_id: bid, user_name: userName })));
+        }
       }
+    } catch (e) {
+      showToast("Couldn't save — " + e.message, 'err');
     }
 
     setIsDragging(false); setDragStart(null); setDragEnd(null); setDragAction(null);
@@ -296,10 +402,32 @@ export default function Heatmap() {
 
   const inputBase = "w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-sm placeholder:text-slate-400 placeholder:font-normal focus:border-emerald-600 focus:outline-none transition-colors";
 
+  const handleStartDateChange = (val) => {
+    setStartDate(val);
+    // Keep the range valid: if the last day is missing or earlier, match the first day
+    if (!endDate || endDate < val) setEndDate(val);
+  };
+
+  const createGroup = async () => {
+    if (!newTitle.trim()) return showToast('Give your event a name.', 'err');
+    if (!startDate || !endDate) return showToast('Pick the first and last days.', 'err');
+    if (endDate < startDate) return showToast("The last day can't be before the first.", 'err');
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const id = makeGroupId();
+      const { error } = await supabase.from('groups').insert({ id, title: newTitle.trim(), start_date: startDate, end_date: endDate, granularity });
+      if (!error) { window.location.hash = `/${id}`; return; }
+      lastError = error;
+      if (!/duplicate|unique/i.test(error.message)) break; // not a collision — don't retry
+    }
+    showToast(lastError?.message || "Couldn't create the event.", 'err');
+  };
+
   // --- VIEWS ---
   if (!groupId) {
     return (
       <div className="min-h-screen bg-paper font-sans text-ink select-none scroll-smooth">
+        {toastEl}
         <nav className="fixed inset-x-0 top-0 z-40 border-b border-slate-200/70 bg-paper/85 backdrop-blur-md">
           <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
             <div className="flex items-center gap-2.5">
@@ -396,11 +524,11 @@ export default function Heatmap() {
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="mb-1.5 block text-sm font-semibold text-slate-700" htmlFor="ev-start">First day</label>
-                  <input id="ev-start" type="date" className={inputBase} value={startDate} onChange={e => setStartDate(e.target.value)} />
+                  <input id="ev-start" type="date" className={inputBase} value={startDate} onChange={e => handleStartDateChange(e.target.value)} />
                 </div>
                 <div>
                   <label className="mb-1.5 block text-sm font-semibold text-slate-700" htmlFor="ev-end">Last day</label>
-                  <input id="ev-end" type="date" className={inputBase} value={endDate} onChange={e => setEndDate(e.target.value)} />
+                  <input id="ev-end" type="date" min={startDate} className={inputBase} value={endDate} onChange={e => setEndDate(e.target.value)} />
                 </div>
               </div>
               <div>
@@ -428,6 +556,25 @@ export default function Heatmap() {
     );
   }
 
+  // --- BAD LINK ---
+  if (notFound) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-paper p-6 font-sans">
+        {toastEl}
+        <div className="max-w-sm rounded-3xl border border-slate-200 bg-white p-10 text-center shadow-xl">
+          <h1 className="font-display text-2xl font-bold tracking-tight">This event doesn't exist</h1>
+          <p className="mt-3 text-sm leading-relaxed text-slate-500">
+            The link may be mistyped, or the event was removed. Ask the organizer for a fresh link.
+          </p>
+          <button onClick={() => { window.location.hash = ''; }}
+            className="mt-6 w-full rounded-xl bg-emerald-600 py-3 text-sm font-semibold text-white transition-colors hover:bg-emerald-700">
+            Back to Venn
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   // --- DASHBOARD ---
   const availNow = hoveredBlock ? (allData || []).filter(d => d.block_id === hoveredBlock).map(d => d.user_name) : [];
   const uniqueList = [...new Set((allData || []).map(d => d.user_name))];
@@ -435,6 +582,7 @@ export default function Heatmap() {
 
   return (
     <div className="min-h-screen overflow-x-hidden bg-paper p-4 font-sans text-ink select-none lg:p-8">
+      {toastEl}
       <div className="mx-auto max-w-[1500px] space-y-6">
 
         <header className="flex flex-col gap-6 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm xl:flex-row xl:items-center xl:justify-between xl:p-8">
@@ -454,7 +602,7 @@ export default function Heatmap() {
               {groupInfo?.title || 'Loading…'}
             </h1>
             <p className="mt-1 text-sm text-slate-400">
-              {groupInfo ? `${new Date(groupInfo.start_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${new Date(groupInfo.end_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} · ${uniqueList.length} ${uniqueList.length === 1 ? 'person' : 'people'}` : ''}
+              {groupInfo ? `${asDate(groupInfo.start_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${asDate(groupInfo.end_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} · ${uniqueList.length} ${uniqueList.length === 1 ? 'person' : 'people'}` : ''}
             </p>
           </div>
 
@@ -462,7 +610,7 @@ export default function Heatmap() {
             <button onClick={() => {
               const customLink = `https://life.minescout.net/projects/booking/index.html${window.location.hash}`;
               navigator.clipboard.writeText(customLink);
-              alert("Link copied!");
+              showToast('Invite link copied.');
             }}
               className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-emerald-700">
               <Share2 size={15} /> Share invite link
@@ -471,14 +619,14 @@ export default function Heatmap() {
             <div>
               <label className="mb-1 block text-xs font-semibold text-slate-500" htmlFor="dash-name">Your name</label>
               <input id="dash-name" type="text" className="w-48 rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm font-medium shadow-sm focus:border-emerald-600 focus:outline-none transition-colors"
-                value={userName} onChange={e => {setUserName(e.target.value); localStorage.setItem('venn_name', e.target.value);}} />
+                value={userName} onChange={e => { setUserName(e.target.value); localStorage.setItem('venn_name', e.target.value); }} />
             </div>
             <div>
               <label className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-slate-500" htmlFor="dash-pw">
                 Password {isLockedBySomeone && <Lock size={11} className="text-emerald-600" />}
               </label>
               <input id="dash-pw" type="password" className={`w-44 rounded-xl border px-3.5 py-2.5 text-sm font-medium shadow-sm focus:outline-none transition-colors ${isLockedBySomeone && !isAuthorized ? 'border-rose-300 text-rose-600' : 'border-slate-200 focus:border-emerald-600'} bg-white`}
-                value={password} onChange={e => {setPassword(e.target.value); localStorage.setItem('venn_pw', e.target.value);}} />
+                value={password} onChange={e => setPassword(e.target.value)} />
             </div>
 
             {isAuthorized && userName && (
@@ -556,15 +704,22 @@ export default function Heatmap() {
               </div>
             </div>
             <div className="overflow-x-auto pb-4">
-              <div className="grid gap-1.5 touch-pan-y" style={{ gridTemplateColumns: `70px repeat(${currentWeekDates.length}, 1fr)` }} onMouseUp={commitDrag} onMouseLeave={() => { if (isDragging) commitDrag(); }}>
+              <div
+                className="grid gap-1.5 touch-pan-y [-webkit-touch-callout:none]"
+                style={{ gridTemplateColumns: `70px repeat(${currentWeekDates.length}, 1fr)` }}
+                onPointerMove={handleGridPointerMove}
+                onPointerUp={commitDrag}
+                onPointerCancel={commitDrag}
+                onPointerLeave={commitDrag}
+              >
                 <div />
                 {currentWeekDates.map(d => (
                   <div key={d} className="pb-3 text-center">
                     <p className={`text-[11px] font-semibold ${d === todayISO ? 'text-emerald-600' : 'text-slate-400'}`}>
-                      {new Date(d).toLocaleDateString('en-US', { weekday: 'short' })}
+                      {asDate(d).toLocaleDateString('en-US', { weekday: 'short' })}
                     </p>
                     <p className={`text-sm font-bold ${d === todayISO ? 'text-emerald-700' : 'text-slate-700'}`}>
-                      {new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                      {asDate(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
                     </p>
                   </div>
                 ))}
@@ -584,8 +739,10 @@ export default function Heatmap() {
                       return (
                         <div
                           key={bid}
-                          onMouseDown={() => handleMouseDown(dIdx, sIdx)}
-                          onMouseEnter={() => handleMouseEnter(dIdx, sIdx)}
+                          data-cell
+                          data-d={dIdx}
+                          data-s={sIdx}
+                          onPointerDown={(e) => handleCellPointerDown(e, dIdx, sIdx)}
                           className={`h-8 cursor-crosshair rounded-md border shadow-sm transition-colors sm:h-9 ${cellBg}`}
                         />
                       );
@@ -600,7 +757,7 @@ export default function Heatmap() {
             <div className="mb-8 flex items-center justify-between">
               <div>
                 <h3 className="font-display text-lg font-bold tracking-tight">Group heatmap</h3>
-                <p className="text-xs text-slate-400">Hover a block to see who's free.</p>
+                <p className="text-xs text-slate-400">Hover or tap a block to see who's free.</p>
               </div>
               <span className="flex items-center gap-1 text-[10px] font-medium text-slate-400">
                 <span className="h-3 w-3 rounded-sm bg-slate-100"></span>
@@ -615,17 +772,17 @@ export default function Heatmap() {
                 {currentWeekDates.map(d => (
                   <div key={d} className="pb-3 text-center">
                     <p className={`text-[11px] font-semibold ${d === todayISO ? 'text-emerald-600' : 'text-slate-400'}`}>
-                      {new Date(d).toLocaleDateString('en-US', { weekday: 'short' })}
+                      {asDate(d).toLocaleDateString('en-US', { weekday: 'short' })}
                     </p>
                   </div>
                 ))}
-                {SLOTS.map((slot, sIdx) => (
+                {SLOTS.map(slot => (
                   <React.Fragment key={slot}>
                     <div className="self-center pr-4 text-right text-[11px] font-medium tabular-nums text-slate-300">{slot}</div>
                     {currentWeekDates.map(date => {
                       const bid = `${date}-${slot}`;
                       return (
-                        <div key={bid} onMouseEnter={() => setHoveredBlock(bid)} onMouseLeave={() => setHoveredBlock(null)}
+                        <div key={bid} onPointerDown={() => setHoveredBlock(bid)} onMouseEnter={() => setHoveredBlock(bid)} onMouseLeave={() => setHoveredBlock(null)}
                           className="h-8 rounded-md border border-slate-200/60 bg-white shadow-sm transition-shadow hover:z-10 hover:shadow-md hover:ring-2 hover:ring-emerald-600/50 sm:h-9"
                           style={getHeatStyle(bid)} />
                       );
@@ -646,7 +803,7 @@ export default function Heatmap() {
                     <p className="mt-0.5 font-display text-2xl font-bold tracking-tight">
                       {hoveredBlock.split('-')[3]}
                       <span className="mx-1.5 text-base font-normal text-slate-300">on</span>
-                      <span className="text-lg">{new Date(hoveredBlock.split('-').slice(0, 3).join('-')).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}</span>
+                      <span className="text-lg">{asDate(hoveredBlock.split('-').slice(0, 3).join('-')).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}</span>
                     </p>
                   </div>
                   <div>
